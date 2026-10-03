@@ -52,3 +52,900 @@ Rayfield:CreateWindow({
 ```
 
 Swap it at runtime with `window:SetTranslator(fn)`, then re-apply the locale to refresh the screen.
+-- =================================================================
+-- FULL ADVANCED FREEZE & AIM HUB (EXPANDED SOURCE)
+-- =================================================================
+
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local Lighting         = game:GetService("Lighting")
+local Players          = game:GetService("Players")
+
+local Camera      = workspace.CurrentCamera
+local PIXEL_FONT  = Enum.Font.Arcade
+local player      = Players.LocalPlayer
+local playerGui   = player:WaitForChild("PlayerGui")
+
+-- Очистка старых интерфейсов
+local oldGui = playerGui:FindFirstChild("FlingSystemGui")
+if oldGui then oldGui:Destroy() end
+
+-- Глобальные настройки
+_G.FlingSettings = _G.FlingSettings or {
+    FlingKey         = Enum.KeyCode.F,
+    ToggleKey        = Enum.KeyCode.RightShift,
+    AimKey           = Enum.UserInputType.MouseButton2, -- ПКМ вместо клавиши E
+    Power            = 110,
+    ESPEnabled       = true,
+    ESPMaxDistance   = 500,
+    ESPShowNames     = true,
+    ESPShowDistance  = true,
+    ESPShowHealth    = true,
+    SilentAimEnabled = false,
+    WallCheckEnabled = true,                            -- Галочка: V (проверка стен), X (сквозь стены)
+    AimSmooth        = 10,                              -- Плавность (1-100)
+    AimControl       = 100,                             -- Сила перехвата (1-100%)
+    FOVSize          = 120,
+    TargetPlayer     = nil
+}
+
+-- -----------------------------------------------------------------
+-- МОДУЛЬ ПЛАВНЫХ АНИМАЦИЙ И ЭФФЕКТОВ ИНТЕРФЕЙСА
+-- -----------------------------------------------------------------
+local function AnimateButton(btn, customHoverColor)
+    local originalSize = btn.Size
+    local originalBg   = btn.BackgroundColor3
+    local tweenFast    = TweenInfo.new(0.12, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    local tweenSlow    = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+    local hoverBg = customHoverColor or Color3.new(
+        math.min(originalBg.R + 0.15, 1),
+        math.min(originalBg.G + 0.15, 1),
+        math.min(originalBg.B + 0.15, 1)
+    )
+
+    btn.MouseEnter:Connect(function()
+        local hoverSize = UDim2.new(originalSize.X.Scale, originalSize.X.Offset + 4, originalSize.Y.Scale, originalSize.Y.Offset + 2)
+        TweenService:Create(btn, tweenSlow, {Size = hoverSize, BackgroundColor3 = hoverBg}):Play()
+    end)
+
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, tweenSlow, {Size = originalSize, BackgroundColor3 = originalBg}):Play()
+    end)
+
+    btn.MouseButton1Down:Connect(function()
+        local clickSize = UDim2.new(originalSize.X.Scale, originalSize.X.Offset - 2, originalSize.Y.Scale, originalSize.Y.Offset - 2)
+        TweenService:Create(btn, tweenFast, {Size = clickSize}):Play()
+    end)
+
+    btn.MouseButton1Up:Connect(function()
+        local hoverSize = UDim2.new(originalSize.X.Scale, originalSize.X.Offset + 4, originalSize.Y.Scale, originalSize.Y.Offset + 2)
+        TweenService:Create(btn, tweenFast, {Size = hoverSize}):Play()
+    end)
+end
+
+-- -----------------------------------------------------------------
+-- 1. СИСТЕМА AIMBOT, RAYCAST WALL CHECK И FOV CIRCLE
+-- -----------------------------------------------------------------
+local FOVCircle        = Drawing.new("Circle")
+FOVCircle.Thickness    = 1.5
+FOVCircle.NumSides     = 60
+FOVCircle.Radius       = _G.FlingSettings.FOVSize
+FOVCircle.Filled       = false
+FOVCircle.Visible      = false
+FOVCircle.Color        = Color3.fromRGB(110, 86, 207)
+FOVCircle.Transparency = 0.75
+
+-- Проверка видимости цели за препятствиями (Wall Check)
+local function IsVisibleThroughWall(targetPart)
+    if not _G.FlingSettings.WallCheckEnabled then
+        return true -- Если Wall Check отключён (крестик X), наводимся сквозь любые стены
+    end
+
+    local origin      = Camera.CFrame.Position
+    local destination = targetPart.Position
+    local direction   = destination - origin
+
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = RaycastFilterType.Exclude
+
+    local ignoreList = {}
+    if player.Character then table.insert(ignoreList, player.Character) end
+    if targetPart.Parent then table.insert(ignoreList, targetPart.Parent) end
+    raycastParams.FilterDescendantsInstances = ignoreList
+
+    local result = workspace:Raycast(origin, direction, raycastParams)
+    return result == nil
+end
+
+-- Поиск ближайшей цели внутри круга FOV с учётом Wall Check
+local function GetClosestTargetInFOV()
+    local closestPlayer    = nil
+    local shortestDistance = _G.FlingSettings.FOVSize
+    local mousePos         = UserInputService:GetMouseLocation()
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local hum        = p.Character:FindFirstChildOfClass("Humanoid")
+            local hrp        = p.Character:FindFirstChild("HumanoidRootPart")
+            local head       = p.Character:FindFirstChild("Head")
+            local targetPart = head or hrp
+
+            if hum and hum.Health > 0 and targetPart then
+                if IsVisibleThroughWall(targetPart) then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                    if onScreen then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                        if dist < shortestDistance then
+                            shortestDistance = dist
+                            closestPlayer    = p
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+-- Хук метатаблицы для перехвата выстрелов/наведения (Silent Aim)
+local rawmetatable = getrawmetatable or debug.getmetatable
+if rawmetatable and setreadonly then
+    local gmt = rawmetatable(game)
+    setreadonly(gmt, false)
+    local oldIndex = gmt.__index
+
+    gmt.__index = newcclosure(function(self, idx)
+        if _G.FlingSettings.SilentAimEnabled and not checkcaller() then
+            if tostring(idx) == "Hit" or tostring(idx) == "Target" then
+                local target = GetClosestTargetInFOV()
+                if target and target.Character then
+                    local targetPart = target.Character:FindFirstChild("Head") or target.Character:FindFirstChild("HumanoidRootPart")
+                    if targetPart then
+                        local mouseCFrame  = oldIndex(self, "Hit")
+                        local targetCFrame = targetPart.CFrame
+
+                        -- Вычисление параметров Smooth (плавность) и Control (сила перехвата)
+                        local controlAlpha = math.clamp(_G.FlingSettings.AimControl / 100, 0.01, 1)
+                        local smoothAlpha  = math.clamp(1 / math.max(_G.FlingSettings.AimSmooth, 1), 0.01, 1)
+                        local finalAlpha   = controlAlpha * smoothAlpha
+
+                        local interpolatedCFrame = mouseCFrame:Lerp(targetCFrame, finalAlpha)
+
+                        if tostring(idx) == "Hit" then
+                            return interpolatedCFrame
+                        elseif tostring(idx) == "Target" then
+                            return targetPart
+                        end
+                    end
+                end
+            end
+        end
+        return oldIndex(self, idx)
+    end)
+    setreadonly(gmt, true)
+end
+
+-- -----------------------------------------------------------------
+-- 2. ПОЛНАЯ ESP СИСТЕМА (CORNER BOX, HEALTH BAR, NAMES, DISTANCE)
+-- -----------------------------------------------------------------
+local ESP_Cache = {}
+
+local function RemoveESP(p)
+    if ESP_Cache[p] then
+        for _, drawObj in pairs(ESP_Cache[p]) do
+            drawObj:Remove()
+        end
+        ESP_Cache[p] = nil
+    end
+end
+
+local function CreateDrawLine()
+    local l     = Drawing.new("Line")
+    l.Thickness = 1.5
+    l.Color     = Color3.fromRGB(255, 60, 60)
+    l.Visible   = false
+    return l
+end
+
+local function SetupESPForPlayer(p)
+    if p == player then return end
+    ESP_Cache[p] = {
+        TL1        = CreateDrawLine(), TL2 = CreateDrawLine(),
+        TR1        = CreateDrawLine(), TR2 = CreateDrawLine(),
+        BL1        = CreateDrawLine(), BL2 = CreateDrawLine(),
+        BR1        = CreateDrawLine(), BR2 = CreateDrawLine(),
+        HealthBg   = Drawing.new("Square"),
+        HealthFill = Drawing.new("Square"),
+        Name       = Drawing.new("Text"),
+        Distance   = Drawing.new("Text")
+    }
+
+    ESP_Cache[p].HealthBg.Thickness = 1
+    ESP_Cache[p].HealthBg.Filled    = true
+    ESP_Cache[p].HealthBg.Color     = Color3.fromRGB(20, 20, 20)
+
+    ESP_Cache[p].HealthFill.Thickness = 1
+    ESP_Cache[p].HealthFill.Filled    = true
+    ESP_Cache[p].HealthFill.Color     = Color3.fromRGB(0, 255, 100)
+
+    ESP_Cache[p].Name.Size    = 13
+    ESP_Cache[p].Name.Center  = true
+    ESP_Cache[p].Name.Outline = true
+    ESP_Cache[p].Name.Color   = Color3.fromRGB(255, 255, 255)
+
+    ESP_Cache[p].Distance.Size    = 11
+    ESP_Cache[p].Distance.Center  = true
+    ESP_Cache[p].Distance.Outline = true
+    ESP_Cache[p].Distance.Color   = Color3.fromRGB(200, 200, 200)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do SetupESPForPlayer(p) end
+Players.PlayerAdded:Connect(SetupESPForPlayer)
+Players.PlayerRemoving:Connect(RemoveESP)
+
+-- Рендер-цикл обновления ESP и FOV
+RunService.RenderStepped:Connect(function()
+    FOVCircle.Position = UserInputService:GetMouseLocation()
+    FOVCircle.Visible  = _G.FlingSettings.SilentAimEnabled
+    FOVCircle.Radius   = _G.FlingSettings.FOVSize
+
+    local myChar = player.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+
+    for p, esp in pairs(ESP_Cache) do
+        local char = p.Character
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+
+        local isCloseEnough = false
+        local distStuds     = 0
+        if myRoot and hrp then
+            distStuds = (hrp.Position - myRoot.Position).Magnitude
+            if distStuds <= _G.FlingSettings.ESPMaxDistance then
+                isCloseEnough = true
+            end
+        end
+
+        if _G.FlingSettings.ESPEnabled and isCloseEnough and char and hum and hrp and hum.Health > 0 then
+            local pos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+            if onScreen then
+                local head    = char:FindFirstChild("Head")
+                local headPos = head and Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.5, 0)) or pos
+                local legPos  = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3, 0))
+
+                local height = math.abs(headPos.Y - legPos.Y)
+                local width  = height * 0.65
+                local x, y   = pos.X - width / 2, pos.Y - height / 2
+
+                local cornerLen = width * 0.25
+
+                -- Отрисовка угловых рам (Corner Box)
+                esp.TL1.From = Vector2.new(x, y);             esp.TL1.To = Vector2.new(x + cornerLen, y);             esp.TL1.Visible = true
+                esp.TL2.From = Vector2.new(x, y);             esp.TL2.To = Vector2.new(x, y + cornerLen);             esp.TL2.Visible = true
+
+                esp.TR1.From = Vector2.new(x + width, y);     esp.TR1.To = Vector2.new(x + width - cornerLen, y);     esp.TR1.Visible = true
+                esp.TR2.From = Vector2.new(x + width, y);     esp.TR2.To = Vector2.new(x + width, y + cornerLen);     esp.TR2.Visible = true
+
+                esp.BL1.From = Vector2.new(x, y + height);     esp.BL1.To = Vector2.new(x + cornerLen, y + height);     esp.BL1.Visible = true
+                esp.BL2.From = Vector2.new(x, y + height);     esp.BL2.To = Vector2.new(x, y + height - cornerLen);     esp.BL2.Visible = true
+
+                esp.BR1.From = Vector2.new(x + width, y + height); esp.BR1.To = Vector2.new(x + width - cornerLen, y + height); esp.BR1.Visible = true
+                esp.BR2.From = Vector2.new(x + width, y + height); esp.BR2.To = Vector2.new(x + width, y + height - cornerLen); esp.BR2.Visible = true
+
+                -- Шкала здоровья (Health Bar)
+                local healthPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                esp.HealthBg.Size     = Vector2.new(3, height)
+                esp.HealthBg.Position = Vector2.new(x - 6, y)
+                esp.HealthBg.Visible  = _G.FlingSettings.ESPShowHealth
+
+                esp.HealthFill.Size     = Vector2.new(3, height * healthPct)
+                esp.HealthFill.Position = Vector2.new(x - 6, y + (height * (1 - healthPct)))
+                esp.HealthFill.Color    = Color3.fromHSV(healthPct * 0.3, 1, 1)
+                esp.HealthFill.Visible  = _G.FlingSettings.ESPShowHealth
+
+                -- Имя игрока
+                esp.Name.Text     = p.Name
+                esp.Name.Position = Vector2.new(pos.X, y - 16)
+                esp.Name.Visible  = _G.FlingSettings.ESPShowNames
+
+                -- Дистанция
+                esp.Distance.Text     = math.floor(distStuds) .. "m"
+                esp.Distance.Position = Vector2.new(pos.X, y + height + 4)
+                esp.Distance.Visible  = _G.FlingSettings.ESPShowDistance
+            else
+                for _, obj in pairs(esp) do obj.Visible = false end
+            end
+        else
+            for _, obj in pairs(esp) do obj.Visible = false end
+        end
+    end
+end)
+
+-- -----------------------------------------------------------------
+-- 3. ПОЛНЫЙ ИНТЕРФЕЙС, ВКЛАДКИ И ЭЛЕМЕНТЫ УПРАВЛЕНИЯ
+-- -----------------------------------------------------------------
+local ScreenGui         = Instance.new("ScreenGui")
+ScreenGui.Name          = "FlingSystemGui"
+ScreenGui.ResetOnSpawn  = false
+ScreenGui.Parent        = playerGui
+
+local isListeningForFlingKey  = false
+local isListeningForToggleKey = false
+local isListeningForAimKey    = false
+local noclipConnection        = nil
+local isOpen                  = true
+
+local TARGET_SIZE = UDim2.new(0, 250, 0, 520)
+local TARGET_POS  = UDim2.new(0.5, -125, 0.5, -260)
+
+local MainFrame                  = Instance.new("Frame")
+MainFrame.Name                   = "MainFrame"
+MainFrame.Size                   = TARGET_SIZE
+MainFrame.Position               = TARGET_POS
+MainFrame.BackgroundColor3       = Color3.fromRGB(20, 20, 28)
+MainFrame.Active                 = true
+MainFrame.Draggable              = true
+MainFrame.ClipsDescendants       = true
+MainFrame.Visible                = true
+MainFrame.Parent                 = ScreenGui
+
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
+
+local UIStroke        = Instance.new("UIStroke")
+UIStroke.Color        = Color3.fromRGB(110, 86, 207)
+UIStroke.Thickness    = 1.5
+UIStroke.Transparency = 0.3
+UIStroke.Parent       = MainFrame
+
+local Title                  = Instance.new("TextLabel")
+Title.Size                   = UDim2.new(1, -60, 0, 25)
+Title.Position               = UDim2.new(0, 12, 0, 6)
+Title.BackgroundTransparency = 1
+Title.Text                   = "FREEZE & AIM HUB"
+Title.TextColor3             = Color3.fromRGB(255, 255, 255)
+Title.Font                   = PIXEL_FONT
+Title.TextSize               = 15
+Title.TextXAlignment         = Enum.TextXAlignment.Left
+Title.Parent                 = MainFrame
+
+local MinimizeBtn             = Instance.new("TextButton")
+MinimizeBtn.Size              = UDim2.new(0, 24, 0, 24)
+MinimizeBtn.Position          = UDim2.new(1, -56, 0, 6)
+MinimizeBtn.BackgroundColor3  = Color3.fromRGB(40, 40, 55)
+MinimizeBtn.Text              = "—"
+MinimizeBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+MinimizeBtn.Font              = PIXEL_FONT
+MinimizeBtn.TextSize          = 14
+MinimizeBtn.Parent            = MainFrame
+Instance.new("UICorner", MinimizeBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(MinimizeBtn)
+
+local DeleteBtn             = Instance.new("TextButton")
+DeleteBtn.Size              = UDim2.new(0, 24, 0, 24)
+DeleteBtn.Position          = UDim2.new(1, -28, 0, 6)
+DeleteBtn.BackgroundColor3  = Color3.fromRGB(220, 60, 60)
+DeleteBtn.Text              = "X"
+DeleteBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+DeleteBtn.Font              = PIXEL_FONT
+DeleteBtn.TextSize          = 14
+DeleteBtn.Parent            = MainFrame
+Instance.new("UICorner", DeleteBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(DeleteBtn)
+
+-- -----------------------------------------------------------------
+-- ВКЛАДКИ (MAIN И AIM)
+-- -----------------------------------------------------------------
+local TabBar                  = Instance.new("Frame")
+TabBar.Size                   = UDim2.new(0.9, 0, 0, 26)
+TabBar.Position               = UDim2.new(0.05, 0, 0.07, 0)
+TabBar.BackgroundTransparency = 1
+TabBar.Parent                 = MainFrame
+
+local MainTabBtn             = Instance.new("TextButton")
+MainTabBtn.Size              = UDim2.new(0.48, 0, 1, 0)
+MainTabBtn.Position          = UDim2.new(0, 0, 0, 0)
+MainTabBtn.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+MainTabBtn.Text              = "MAIN"
+MainTabBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+MainTabBtn.Font              = PIXEL_FONT
+MainTabBtn.TextSize          = 12
+MainTabBtn.Parent            = TabBar
+Instance.new("UICorner", MainTabBtn).CornerRadius = UDim.new(0, 6)
+
+local AimTabBtn             = Instance.new("TextButton")
+AimTabBtn.Size              = UDim2.new(0.48, 0, 1, 0)
+AimTabBtn.Position          = UDim2.new(0.52, 0, 0, 0)
+AimTabBtn.BackgroundColor3  = Color3.fromRGB(38, 38, 52)
+AimTabBtn.Text              = "AIM"
+AimTabBtn.TextColor3        = Color3.fromRGB(180, 180, 200)
+AimTabBtn.Font              = PIXEL_FONT
+AimTabBtn.TextSize          = 12
+AimTabBtn.Parent            = TabBar
+Instance.new("UICorner", AimTabBtn).CornerRadius = UDim.new(0, 6)
+
+local MainTabFrame                  = Instance.new("Frame")
+MainTabFrame.Size                  = UDim2.new(1, 0, 0.86, 0)
+MainTabFrame.Position              = UDim2.new(0, 0, 0.14, 0)
+MainTabFrame.BackgroundTransparency = 1
+MainTabFrame.Visible               = true
+MainTabFrame.Parent                = MainFrame
+
+local AimTabFrame                  = Instance.new("Frame")
+AimTabFrame.Size                  = UDim2.new(1, 0, 0.86, 0)
+AimTabFrame.Position              = UDim2.new(0, 0, 0.14, 0)
+AimTabFrame.BackgroundTransparency = 1
+AimTabFrame.Visible               = false
+AimTabFrame.Parent                = MainFrame
+
+MainTabBtn.MouseButton1Click:Connect(function()
+    MainTabFrame.Visible        = true
+    AimTabFrame.Visible         = false
+    MainTabBtn.BackgroundColor3 = Color3.fromRGB(110, 86, 207)
+    MainTabBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    AimTabBtn.BackgroundColor3  = Color3.fromRGB(38, 38, 52)
+    AimTabBtn.TextColor3       = Color3.fromRGB(180, 180, 200)
+end)
+
+AimTabBtn.MouseButton1Click:Connect(function()
+    MainTabFrame.Visible        = false
+    AimTabFrame.Visible         = true
+    AimTabBtn.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+    AimTabBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    MainTabBtn.BackgroundColor3 = Color3.fromRGB(38, 38, 52)
+    MainTabBtn.TextColor3       = Color3.fromRGB(180, 180, 200)
+end)
+
+-- -----------------------------------------------------------------
+-- ВКЛАДКА MAIN
+-- -----------------------------------------------------------------
+local FlingBtn             = Instance.new("TextButton")
+FlingBtn.Size              = UDim2.new(0.9, 0, 0, 28)
+FlingBtn.Position          = UDim2.new(0.05, 0, 0.02, 0)
+FlingBtn.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+FlingBtn.Text              = "FLING"
+FlingBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+FlingBtn.Font              = PIXEL_FONT
+FlingBtn.TextSize          = 15
+FlingBtn.Parent            = MainTabFrame
+Instance.new("UICorner", FlingBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(FlingBtn)
+
+local SliderLabel                  = Instance.new("TextLabel")
+SliderLabel.Size                   = UDim2.new(0.9, 0, 0, 14)
+SliderLabel.Position               = UDim2.new(0.05, 0, 0.12, 0)
+SliderLabel.BackgroundTransparency = 1
+SliderLabel.Text                   = "POWER: " .. _G.FlingSettings.Power
+SliderLabel.TextColor3             = Color3.fromRGB(200, 200, 220)
+SliderLabel.Font                   = PIXEL_FONT
+SliderLabel.TextSize               = 12
+SliderLabel.TextXAlignment         = Enum.TextXAlignment.Left
+SliderLabel.Parent                 = MainTabFrame
+
+local SliderTrack             = Instance.new("Frame")
+SliderTrack.Size              = UDim2.new(0.9, 0, 0, 6)
+SliderTrack.Position          = UDim2.new(0.05, 0, 0.17, 0)
+SliderTrack.BackgroundColor3  = Color3.fromRGB(45, 45, 60)
+SliderTrack.Parent            = MainTabFrame
+Instance.new("UICorner", SliderTrack).CornerRadius = UDim.new(1, 0)
+
+local SliderFill             = Instance.new("Frame")
+SliderFill.Size              = UDim2.new(_G.FlingSettings.Power / 1000, 0, 1, 0)
+SliderFill.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+SliderFill.Parent            = SliderTrack
+Instance.new("UICorner", SliderFill).CornerRadius = UDim.new(1, 0)
+
+local SliderBtn             = Instance.new("TextButton")
+SliderBtn.Size              = UDim2.new(0, 14, 0, 14)
+SliderBtn.Position          = UDim2.new(_G.FlingSettings.Power / 1000, -7, 0.5, -7)
+SliderBtn.BackgroundColor3  = Color3.fromRGB(255, 255, 255)
+SliderBtn.Text              = ""
+SliderBtn.Parent            = SliderTrack
+Instance.new("UICorner", SliderBtn).CornerRadius = UDim.new(1, 0)
+
+local EspToggleBtn             = Instance.new("TextButton")
+EspToggleBtn.Size              = UDim2.new(0.9, 0, 0, 26)
+EspToggleBtn.Position          = UDim2.new(0.05, 0, 0.25, 0)
+EspToggleBtn.BackgroundColor3  = _G.FlingSettings.ESPEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+EspToggleBtn.Text              = "NEAR ESP: [ " .. (_G.FlingSettings.ESPEnabled and "ON" or "OFF") .. " ]"
+EspToggleBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+EspToggleBtn.Font              = PIXEL_FONT
+EspToggleBtn.TextSize          = 12
+EspToggleBtn.Parent            = MainTabFrame
+Instance.new("UICorner", EspToggleBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(EspToggleBtn)
+
+EspToggleBtn.MouseButton1Click:Connect(function()
+    _G.FlingSettings.ESPEnabled = not _G.FlingSettings.ESPEnabled
+    EspToggleBtn.Text = "NEAR ESP: [ " .. (_G.FlingSettings.ESPEnabled and "ON" or "OFF") .. " ]"
+    local targetColor = _G.FlingSettings.ESPEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+    TweenService:Create(EspToggleBtn, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
+end)
+
+local KeybindBtn             = Instance.new("TextButton")
+KeybindBtn.Size              = UDim2.new(0.9, 0, 0, 24)
+KeybindBtn.Position          = UDim2.new(0.05, 0, 0.65, 0)
+KeybindBtn.BackgroundColor3  = Color3.fromRGB(38, 38, 52)
+KeybindBtn.Text              = "FLING KEY: [ " .. _G.FlingSettings.FlingKey.Name .. " ]"
+KeybindBtn.TextColor3        = Color3.fromRGB(200, 200, 220)
+KeybindBtn.Font              = PIXEL_FONT
+KeybindBtn.TextSize          = 12
+KeybindBtn.Parent            = MainTabFrame
+Instance.new("UICorner", KeybindBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(KeybindBtn)
+
+local ToggleKeybindBtn             = Instance.new("TextButton")
+ToggleKeybindBtn.Size              = UDim2.new(0.9, 0, 0, 24)
+ToggleKeybindBtn.Position          = UDim2.new(0.05, 0, 0.73, 0)
+ToggleKeybindBtn.BackgroundColor3  = Color3.fromRGB(38, 38, 52)
+ToggleKeybindBtn.Text              = "HIDE KEY: [ " .. _G.FlingSettings.ToggleKey.Name .. " ]"
+ToggleKeybindBtn.TextColor3        = Color3.fromRGB(200, 200, 220)
+ToggleKeybindBtn.Font              = PIXEL_FONT
+ToggleKeybindBtn.TextSize          = 12
+ToggleKeybindBtn.Parent            = MainTabFrame
+Instance.new("UICorner", ToggleKeybindBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(ToggleKeybindBtn)
+
+-- -----------------------------------------------------------------
+-- ВКЛАДКА AIM
+-- -----------------------------------------------------------------
+local SilentAimToggleBtn             = Instance.new("TextButton")
+SilentAimToggleBtn.Size              = UDim2.new(0.9, 0, 0, 26)
+SilentAimToggleBtn.Position          = UDim2.new(0.05, 0, 0.01, 0)
+SilentAimToggleBtn.BackgroundColor3  = _G.FlingSettings.SilentAimEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+SilentAimToggleBtn.Text              = "SILENT AIM: [ " .. (_G.FlingSettings.SilentAimEnabled and "ON" or "OFF") .. " ]"
+SilentAimToggleBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+SilentAimToggleBtn.Font              = PIXEL_FONT
+SilentAimToggleBtn.TextSize          = 12
+SilentAimToggleBtn.Parent            = AimTabFrame
+Instance.new("UICorner", SilentAimToggleBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(SilentAimToggleBtn)
+
+SilentAimToggleBtn.MouseButton1Click:Connect(function()
+    _G.FlingSettings.SilentAimEnabled = not _G.FlingSettings.SilentAimEnabled
+    SilentAimToggleBtn.Text = "SILENT AIM: [ " .. (_G.FlingSettings.SilentAimEnabled and "ON" or "OFF") .. " ]"
+    local targetColor = _G.FlingSettings.SilentAimEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+    TweenService:Create(SilentAimToggleBtn, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
+end)
+
+-- Wall Check Toggle [ V ] / [ X ]
+local WallCheckBtn             = Instance.new("TextButton")
+WallCheckBtn.Size              = UDim2.new(0.9, 0, 0, 26)
+WallCheckBtn.Position          = UDim2.new(0.05, 0, 0.09, 0)
+WallCheckBtn.BackgroundColor3  = _G.FlingSettings.WallCheckEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+WallCheckBtn.Text              = "WALL CHECK: [ " .. (_G.FlingSettings.WallCheckEnabled and "V" or "X") .. " ]"
+WallCheckBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+WallCheckBtn.Font              = PIXEL_FONT
+WallCheckBtn.TextSize          = 12
+WallCheckBtn.Parent            = AimTabFrame
+Instance.new("UICorner", WallCheckBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(WallCheckBtn)
+
+WallCheckBtn.MouseButton1Click:Connect(function()
+    _G.FlingSettings.WallCheckEnabled = not _G.FlingSettings.WallCheckEnabled
+    WallCheckBtn.Text = "WALL CHECK: [ " .. (_G.FlingSettings.WallCheckEnabled and "V" or "X") .. " ]"
+    local targetColor = _G.FlingSettings.WallCheckEnabled and Color3.fromRGB(40, 90, 50) or Color3.fromRGB(60, 40, 40)
+    TweenService:Create(WallCheckBtn, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
+end)
+
+-- FOV Slider
+local FOVSliderLabel                  = Instance.new("TextLabel")
+FOVSliderLabel.Size                   = UDim2.new(0.9, 0, 0, 14)
+FOVSliderLabel.Position               = UDim2.new(0.05, 0, 0.17, 0)
+FOVSliderLabel.BackgroundTransparency = 1
+FOVSliderLabel.Text                   = "FOV SIZE: " .. _G.FlingSettings.FOVSize
+FOVSliderLabel.TextColor3             = Color3.fromRGB(200, 200, 220)
+FOVSliderLabel.Font                   = PIXEL_FONT
+FOVSliderLabel.TextSize               = 12
+FOVSliderLabel.TextXAlignment         = Enum.TextXAlignment.Left
+FOVSliderLabel.Parent                 = AimTabFrame
+
+local FOVSliderTrack             = Instance.new("Frame")
+FOVSliderTrack.Size              = UDim2.new(0.9, 0, 0, 6)
+FOVSliderTrack.Position          = UDim2.new(0.05, 0, 0.22, 0)
+FOVSliderTrack.BackgroundColor3  = Color3.fromRGB(45, 45, 60)
+FOVSliderTrack.Parent            = AimTabFrame
+Instance.new("UICorner", FOVSliderTrack).CornerRadius = UDim.new(1, 0)
+
+local FOVSliderFill             = Instance.new("Frame")
+FOVSliderFill.Size              = UDim2.new(_G.FlingSettings.FOVSize / 500, 0, 1, 0)
+FOVSliderFill.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+FOVSliderFill.Parent            = FOVSliderTrack
+Instance.new("UICorner", FOVSliderFill).CornerRadius = UDim.new(1, 0)
+
+local FOVSliderBtn             = Instance.new("TextButton")
+FOVSliderBtn.Size              = UDim2.new(0, 14, 0, 14)
+FOVSliderBtn.Position          = UDim2.new(_G.FlingSettings.FOVSize / 500, -7, 0.5, -7)
+FOVSliderBtn.BackgroundColor3  = Color3.fromRGB(255, 255, 255)
+FOVSliderBtn.Text              = ""
+FOVSliderBtn.Parent            = FOVSliderTrack
+Instance.new("UICorner", FOVSliderBtn).CornerRadius = UDim.new(1, 0)
+
+-- Smooth Slider (1-100)
+local SmoothLabel                  = Instance.new("TextLabel")
+SmoothLabel.Size                   = UDim2.new(0.9, 0, 0, 14)
+SmoothLabel.Position               = UDim2.new(0.05, 0, 0.27, 0)
+SmoothLabel.BackgroundTransparency = 1
+SmoothLabel.Text                   = "SMOOTH: " .. _G.FlingSettings.AimSmooth
+SmoothLabel.TextColor3             = Color3.fromRGB(200, 200, 220)
+SmoothLabel.Font                   = PIXEL_FONT
+SmoothLabel.TextSize               = 12
+SmoothLabel.TextXAlignment         = Enum.TextXAlignment.Left
+SmoothLabel.Parent                 = AimTabFrame
+
+local SmoothTrack             = Instance.new("Frame")
+SmoothTrack.Size              = UDim2.new(0.9, 0, 0, 6)
+SmoothTrack.Position          = UDim2.new(0.05, 0, 0.32, 0)
+SmoothTrack.BackgroundColor3  = Color3.fromRGB(45, 45, 60)
+SmoothTrack.Parent            = AimTabFrame
+Instance.new("UICorner", SmoothTrack).CornerRadius = UDim.new(1, 0)
+
+local SmoothFill             = Instance.new("Frame")
+SmoothFill.Size              = UDim2.new(_G.FlingSettings.AimSmooth / 100, 0, 1, 0)
+SmoothFill.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+SmoothFill.Parent            = SmoothTrack
+Instance.new("UICorner", SmoothFill).CornerRadius = UDim.new(1, 0)
+
+local SmoothBtn             = Instance.new("TextButton")
+SmoothBtn.Size              = UDim2.new(0, 14, 0, 14)
+SmoothBtn.Position          = UDim2.new(_G.FlingSettings.AimSmooth / 100, -7, 0.5, -7)
+SmoothBtn.BackgroundColor3  = Color3.fromRGB(255, 255, 255)
+SmoothBtn.Text              = ""
+SmoothBtn.Parent            = SmoothTrack
+Instance.new("UICorner", SmoothBtn).CornerRadius = UDim.new(1, 0)
+
+-- Control Slider (1-100)
+local ControlLabel                  = Instance.new("TextLabel")
+ControlLabel.Size                   = UDim2.new(0.9, 0, 0, 14)
+ControlLabel.Position               = UDim2.new(0.05, 0, 0.37, 0)
+ControlLabel.BackgroundTransparency = 1
+ControlLabel.Text                   = "CONTROL: " .. _G.FlingSettings.AimControl .. "%"
+ControlLabel.TextColor3             = Color3.fromRGB(200, 200, 220)
+ControlLabel.Font                   = PIXEL_FONT
+ControlLabel.TextSize               = 12
+ControlLabel.TextXAlignment         = Enum.TextXAlignment.Left
+ControlLabel.Parent                 = AimTabFrame
+
+local ControlTrack             = Instance.new("Frame")
+ControlTrack.Size              = UDim2.new(0.9, 0, 0, 6)
+ControlTrack.Position          = UDim2.new(0.05, 0, 0.42, 0)
+ControlTrack.BackgroundColor3  = Color3.fromRGB(45, 45, 60)
+ControlTrack.Parent            = AimTabFrame
+Instance.new("UICorner", ControlTrack).CornerRadius = UDim.new(1, 0)
+
+local ControlFill             = Instance.new("Frame")
+ControlFill.Size              = UDim2.new(_G.FlingSettings.AimControl / 100, 0, 1, 0)
+ControlFill.BackgroundColor3  = Color3.fromRGB(110, 86, 207)
+ControlFill.Parent            = ControlTrack
+Instance.new("UICorner", ControlFill).CornerRadius = UDim.new(1, 0)
+
+local ControlBtn             = Instance.new("TextButton")
+ControlBtn.Size              = UDim2.new(0, 14, 0, 14)
+ControlBtn.Position          = UDim2.new(_G.FlingSettings.AimControl / 100, -7, 0.5, -7)
+ControlBtn.BackgroundColor3  = Color3.fromRGB(255, 255, 255)
+ControlBtn.Text              = ""
+ControlBtn.Parent            = ControlTrack
+Instance.new("UICorner", ControlBtn).CornerRadius = UDim.new(1, 0)
+
+-- Aim Keybind
+local AimKeybindBtn             = Instance.new("TextButton")
+AimKeybindBtn.Size              = UDim2.new(0.9, 0, 0, 24)
+AimKeybindBtn.Position          = UDim2.new(0.05, 0, 0.65, 0)
+AimKeybindBtn.BackgroundColor3  = Color3.fromRGB(38, 38, 52)
+AimKeybindBtn.Text              = "AIM KEY: [ " .. tostring(_G.FlingSettings.AimKey.Name or _G.FlingSettings.AimKey) .. " ]"
+AimKeybindBtn.TextColor3        = Color3.fromRGB(200, 200, 220)
+AimKeybindBtn.Font              = PIXEL_FONT
+AimKeybindBtn.TextSize          = 12
+AimKeybindBtn.Parent            = AimTabFrame
+Instance.new("UICorner", AimKeybindBtn).CornerRadius = UDim.new(0, 6)
+AnimateButton(AimKeybindBtn)
+
+-- -----------------------------------------------------------------
+-- 4. ОБРАБОТЧИКИ ПОЛЗУНКОВ И АНИМАЦИИ
+-- -----------------------------------------------------------------
+local function ToggleWindow()
+    isOpen = not isOpen
+    local tInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    if isOpen then
+        MainFrame.Visible = true
+        TweenService:Create(MainFrame, tInfo, {Size = TARGET_SIZE, BackgroundTransparency = 0}):Play()
+    else
+        local hideTween = TweenService:Create(MainFrame, tInfo, {Size = UDim2.new(0, 250, 0, 0), BackgroundTransparency = 0.5})
+        hideTween:Play()
+        hideTween.Completed:Connect(function() if not isOpen then MainFrame.Visible = false end end)
+    end
+end
+
+local draggingSlider        = false
+local draggingFOVSlider     = false
+local draggingSmoothSlider  = false
+local draggingControlSlider = false
+
+local function SetPowerValue(value)
+    _G.FlingSettings.Power = math.clamp(value, 1, 1000)
+    local scale     = _G.FlingSettings.Power / 1000
+    local tweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    TweenService:Create(SliderFill, tweenInfo, {Size = UDim2.new(scale, 0, 1, 0)}):Play()
+    TweenService:Create(SliderBtn, tweenInfo, {Position = UDim2.new(scale, -7, 0.5, -7)}):Play()
+    SliderLabel.Text = "POWER: " .. tostring(_G.FlingSettings.Power)
+end
+
+local function SetFOVValue(value)
+    _G.FlingSettings.FOVSize = math.clamp(value, 10, 500)
+    local scale     = _G.FlingSettings.FOVSize / 500
+    local tweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    TweenService:Create(FOVSliderFill, tweenInfo, {Size = UDim2.new(scale, 0, 1, 0)}):Play()
+    TweenService:Create(FOVSliderBtn, tweenInfo, {Position = UDim2.new(scale, -7, 0.5, -7)}):Play()
+    FOVSliderLabel.Text = "FOV SIZE: " .. tostring(_G.FlingSettings.FOVSize)
+end
+
+local function SetSmoothValue(value)
+    _G.FlingSettings.AimSmooth = math.clamp(value, 1, 100)
+    local scale     = _G.FlingSettings.AimSmooth / 100
+    local tweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    TweenService:Create(SmoothFill, tweenInfo, {Size = UDim2.new(scale, 0, 1, 0)}):Play()
+    TweenService:Create(SmoothBtn, tweenInfo, {Position = UDim2.new(scale, -7, 0.5, -7)}):Play()
+    SmoothLabel.Text = "SMOOTH: " .. tostring(_G.FlingSettings.AimSmooth)
+end
+
+local function SetControlValue(value)
+    _G.FlingSettings.AimControl = math.clamp(value, 1, 100)
+    local scale     = _G.FlingSettings.AimControl / 100
+    local tweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    TweenService:Create(ControlFill, tweenInfo, {Size = UDim2.new(scale, 0, 1, 0)}):Play()
+    TweenService:Create(ControlBtn, tweenInfo, {Position = UDim2.new(scale, -7, 0.5, -7)}):Play()
+    ControlLabel.Text = "CONTROL: " .. tostring(_G.FlingSettings.AimControl) .. "%"
+end
+
+SliderBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then draggingSlider = true end
+end)
+
+FOVSliderBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then draggingFOVSlider = true end
+end)
+
+SmoothBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then draggingSmoothSlider = true end
+end)
+
+ControlBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then draggingControlSlider = true end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then 
+        draggingSlider        = false 
+        draggingFOVSlider     = false
+        draggingSmoothSlider  = false
+        draggingControlSlider = false
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        if draggingSlider then
+            local trackAbsPos  = SliderTrack.AbsolutePosition.X
+            local trackAbsSize = SliderTrack.AbsoluteSize.X
+            if trackAbsSize > 0 then
+                local scale = math.clamp((input.Position.X - trackAbsPos) / trackAbsSize, 0, 1)
+                SetPowerValue(math.round(scale * 1000))
+            end
+        elseif draggingFOVSlider then
+            local trackAbsPos  = FOVSliderTrack.AbsolutePosition.X
+            local trackAbsSize = FOVSliderTrack.AbsoluteSize.X
+            if trackAbsSize > 0 then
+                local scale = math.clamp((input.Position.X - trackAbsPos) / trackAbsSize, 0, 1)
+                SetFOVValue(math.round(scale * 500))
+            end
+        elseif draggingSmoothSlider then
+            local trackAbsPos  = SmoothTrack.AbsolutePosition.X
+            local trackAbsSize = SmoothTrack.AbsoluteSize.X
+            if trackAbsSize > 0 then
+                local scale = math.clamp((input.Position.X - trackAbsPos) / trackAbsSize, 0, 1)
+                SetSmoothValue(math.round(scale * 100))
+            end
+        elseif draggingControlSlider then
+            local trackAbsPos  = ControlTrack.AbsolutePosition.X
+            local trackAbsSize = ControlTrack.AbsoluteSize.X
+            if trackAbsSize > 0 then
+                local scale = math.clamp((input.Position.X - trackAbsPos) / trackAbsSize, 0, 1)
+                SetControlValue(math.round(scale * 100))
+            end
+        end
+    end
+end)
+
+-- -----------------------------------------------------------------
+-- 5. МЕХАНИКА ФЛИГА И ФИЗИКИ ПЕРСОНАЖА
+-- -----------------------------------------------------------------
+local function ResetCharacterPhysics()
+    if noclipConnection then noclipConnection:Disconnect(); noclipConnection = nil end
+    local char = player.Character
+    if char then
+        for _, part in ipairs(char:GetChildren()) do if part:IsA("BasePart") then part.CanCollide = true end end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.PlatformStand = false; hum:ChangeState(Enum.HumanoidStateType.GettingUp) end
+    end
+end
+
+local function ApplyFling()
+    if isOpen then ToggleWindow() end
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+
+    if root and hum then
+        hum.PlatformStand = true
+        hum:ChangeState(Enum.HumanoidStateType.Physics)
+        if noclipConnection then noclipConnection:Disconnect() end
+
+        noclipConnection = RunService.Stepped:Connect(function()
+            if char and char.Parent then
+                for _, part in ipairs(char:GetChildren()) do if part:IsA("BasePart") then part.CanCollide = false end end
+            end
+        end)
+
+        local rotForce = math.clamp(_G.FlingSettings.Power / 6, 10, 120)
+        root.AssemblyAngularVelocity = Vector3.new(math.random(-rotForce, rotForce), math.random(-rotForce, rotForce), math.random(-rotForce, rotForce))
+        root.AssemblyLinearVelocity  = Vector3.new(0, _G.FlingSettings.Power, 0)
+
+        task.delay(math.clamp(_G.FlingSettings.Power / 250, 0.5, 2.2), function() ResetCharacterPhysics() end)
+    end
+end
+
+-- -----------------------------------------------------------------
+-- 6. ОБРАБОТЧИКИ НАЖАТИЙ КЛАВИШ И МЫШИ
+-- -----------------------------------------------------------------
+FlingBtn.MouseButton1Click:Connect(ApplyFling)
+MinimizeBtn.MouseButton1Click:Connect(ToggleWindow)
+
+DeleteBtn.MouseButton1Click:Connect(function()
+    ResetCharacterPhysics()
+    FOVCircle:Remove()
+    for _, esp in pairs(ESP_Cache) do
+        for _, obj in pairs(esp) do obj:Remove() end
+    end
+    isOpen = false
+    ScreenGui:Destroy()
+end)
+
+AimKeybindBtn.MouseButton1Click:Connect(function()
+    isListeningForAimKey = true; AimKeybindBtn.Text = "PRESS ANY KEY/BTN..."
+end)
+KeybindBtn.MouseButton1Click:Connect(function()
+    isListeningForFlingKey = true; KeybindBtn.Text = "PRESS ANY KEY..."
+end)
+ToggleKeybindBtn.MouseButton1Click:Connect(function()
+    isListeningForToggleKey = true; ToggleKeybindBtn.Text = "HIDE KEY..."
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if isListeningForAimKey then
+        local key = (input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode) or input.UserInputType
+        _G.FlingSettings.AimKey = key
+        AimKeybindBtn.Text = "AIM KEY: [ " .. tostring(key.Name or key) .. " ]"
+        isListeningForAimKey = false
+    elseif isListeningForFlingKey and input.UserInputType == Enum.UserInputType.Keyboard then
+        _G.FlingSettings.FlingKey = input.KeyCode
+        KeybindBtn.Text = "FLING KEY: [ " .. input.KeyCode.Name .. " ]"
+        isListeningForFlingKey = false
+    elseif isListeningForToggleKey and input.UserInputType == Enum.UserInputType.Keyboard then
+        _G.FlingSettings.ToggleKey = input.KeyCode
+        ToggleKeybindBtn.Text = "HIDE KEY: [ " .. input.KeyCode.Name .. " ]"
+        isListeningForToggleKey = false
+    else
+        local pressedKey = input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode or input.UserInputType
+        if pressedKey == _G.FlingSettings.AimKey then
+            _G.FlingSettings.SilentAimEnabled = not _G.FlingSettings.SilentAimEnabled
+            SilentAimToggleBtn.Text = "SILENT AIM: [ " .. (_G.FlingSettings.SilentAimEnabled and "ON" or "OFF") .. " ]"
+        elseif input.KeyCode == _G.FlingSettings.FlingKey then
+            ApplyFling()
+        elseif input.KeyCode == _G.FlingSettings.ToggleKey then
+            ToggleWindow()
+        end
+    end
+end)
